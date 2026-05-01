@@ -226,7 +226,7 @@ def run_single_replication(seed: int, config: SimConfig) -> Dict:
 
 
 def run_simulation(params: Dict, progress_callback=None) -> Dict:
-    """Run multiple replications and aggregate results."""
+    """Run multiple replications and aggregate results, including per-replication SDs."""
     # Support legacy single buffer_days param as fallback for backward compatibility
     if 'buffer_days_e' in params and 'buffer_days_f' in params:
         buf_e = params['buffer_days_e']
@@ -251,12 +251,15 @@ def run_simulation(params: Dict, progress_callback=None) -> Dict:
         target_q_f=params.get('target_q_f', None),
     )
     
+    # Daily-level tracking (across reps)
     all_daily_q_e = []
     all_daily_q_f = []
     all_daily_blocked_e = []
     all_daily_blocked_f = []
     all_daily_arrivals_e = []
     all_daily_arrivals_f = []
+    
+    # Patient-level tracking (across reps, pooled)
     all_wait_resolved = []
     all_wait_converted = []
     all_wait_direct = []
@@ -264,6 +267,20 @@ def run_simulation(params: Dict, progress_callback=None) -> Dict:
     all_target_days_e = []
     all_target_days_f = []
     
+    # Per-replication summary metrics (one number per rep -> SD across reps)
+    per_rep_avg_wait_e = []          # mean wait of resolved eConsult patients in this rep
+    per_rep_avg_wait_f = []          # mean wait of all FTF patients in this rep
+    per_rep_avg_wait_direct = []     # mean wait of direct FTF patients in this rep
+    per_rep_avg_wait_converted = []  # mean total system time of converted patients in this rep
+    per_rep_weighted_wait = []       # weighted-avg wait across all categories in this rep
+    per_rep_avg_queue_e = []         # mean queue length (post-warmup) in this rep
+    per_rep_avg_queue_f = []         # same for FTF
+    per_rep_block_rate_e = []        # blocking rate (%) in this rep
+    per_rep_block_rate_f = []        # same for FTF
+    per_rep_rho_e_emp = []           # empirical eConsult utilization in this rep
+    per_rep_rho_f_emp = []           # empirical FTF utilization in this rep
+    
+    # Aggregate counters (still useful for global stats)
     total_blocked_e = 0
     total_blocked_f = 0
     total_arrivals_e_actual = 0
@@ -271,11 +288,14 @@ def run_simulation(params: Dict, progress_callback=None) -> Dict:
     total_served_e = 0
     total_served_f = 0
     
+    warmup = config.warmup_days
+    
     for seed in range(1, config.num_replications + 1):
         if progress_callback:
             progress_callback(seed - 1, config.num_replications, "simulation")
         rep_result = run_single_replication(seed, config)
         
+        # Daily-level
         all_daily_q_e.append(rep_result['daily_q_e'])
         all_daily_q_f.append(rep_result['daily_q_f'])
         all_daily_blocked_e.append(rep_result['daily_blocked_e'])
@@ -284,82 +304,159 @@ def run_simulation(params: Dict, progress_callback=None) -> Dict:
         daily_arrivals_f_total = rep_result['daily_arrivals_f_direct'] + rep_result['daily_arrivals_f_converted']
         all_daily_arrivals_f.append(daily_arrivals_f_total)
         
+        # Target day capture
         if rep_result['target_day_e'] is not None:
             all_target_days_e.append(rep_result['target_day_e'])
         if rep_result['target_day_f'] is not None:
             all_target_days_f.append(rep_result['target_day_f'])
         
+        # Patient-level wait times (already filtered to post-warmup inside run_single_replication)
         all_wait_resolved.extend(rep_result['wait_times_resolved'])
         all_wait_converted.extend(rep_result['wait_times_converted'])
         all_wait_direct.extend(rep_result['wait_times_direct_ftf'])
         
-        for day in range(config.warmup_days, config.sim_horizon):
-            all_ftf_wait_times.extend(rep_result['daily_ftf_wait_times'][day])
+        # Collect per-rep FTF wait times for "all patients" stat
+        rep_ftf_wait_all = []
+        for day in range(warmup, config.sim_horizon):
+            rep_ftf_wait_all.extend(rep_result['daily_ftf_wait_times'][day])
+        all_ftf_wait_times.extend(rep_ftf_wait_all)
         
-        warmup = config.warmup_days
-        total_blocked_e += np.sum(rep_result['daily_blocked_e'][warmup:])
-        total_blocked_f += np.sum(rep_result['daily_blocked_f'][warmup:])
-        total_served_e += np.sum(rep_result['daily_served_e'][warmup:])
-        total_served_f += np.sum(rep_result['daily_served_f'][warmup:])
+        # ---- Per-rep summary metrics ----
+        # Wait time means within this rep (only post-warmup data)
+        rep_resolved = rep_result['wait_times_resolved']
+        rep_direct = rep_result['wait_times_direct_ftf']
+        rep_converted = rep_result['wait_times_converted']
         
-        total_arrivals_e_actual += np.sum(rep_result['daily_arrivals_e'][warmup:])
-        total_arrivals_f_actual += np.sum(rep_result['daily_arrivals_f_direct'][warmup:]) + \
-                                   np.sum(rep_result['daily_arrivals_f_converted'][warmup:])
+        rep_avg_wait_e = float(np.mean(rep_resolved)) if rep_resolved else 0.0
+        rep_avg_wait_direct = float(np.mean(rep_direct)) if rep_direct else 0.0
+        rep_avg_wait_converted = float(np.mean(rep_converted)) if rep_converted else 0.0
+        rep_avg_wait_f = float(np.mean(rep_ftf_wait_all)) if rep_ftf_wait_all else 0.0
+        
+        # Weighted average within rep
+        n_r = len(rep_resolved)
+        n_c = len(rep_converted)
+        n_d = len(rep_direct)
+        n_t = n_r + n_c + n_d
+        if n_t > 0:
+            rep_weighted = (
+                (n_r / n_t) * rep_avg_wait_e +
+                (n_c / n_t) * rep_avg_wait_converted +
+                (n_d / n_t) * rep_avg_wait_direct
+            )
+        else:
+            rep_weighted = 0.0
+        
+        per_rep_avg_wait_e.append(rep_avg_wait_e)
+        per_rep_avg_wait_f.append(rep_avg_wait_f)
+        per_rep_avg_wait_direct.append(rep_avg_wait_direct)
+        per_rep_avg_wait_converted.append(rep_avg_wait_converted)
+        per_rep_weighted_wait.append(rep_weighted)
+        
+        # Queue length means (post-warmup)
+        per_rep_avg_queue_e.append(float(rep_result['daily_q_e'][warmup:].mean()))
+        per_rep_avg_queue_f.append(float(rep_result['daily_q_f'][warmup:].mean()))
+        
+        # Blocking rates within this rep (%)
+        rep_blocked_e = int(np.sum(rep_result['daily_blocked_e'][warmup:]))
+        rep_blocked_f = int(np.sum(rep_result['daily_blocked_f'][warmup:]))
+        rep_arrivals_e = int(np.sum(rep_result['daily_arrivals_e'][warmup:]))
+        rep_arrivals_f_direct = int(np.sum(rep_result['daily_arrivals_f_direct'][warmup:]))
+        rep_arrivals_f_converted = int(np.sum(rep_result['daily_arrivals_f_converted'][warmup:]))
+        rep_arrivals_f_total = rep_arrivals_f_direct + rep_arrivals_f_converted
+        
+        rep_block_rate_e = (rep_blocked_e / rep_arrivals_e * 100) if rep_arrivals_e > 0 else 0.0
+        rep_block_rate_f = (rep_blocked_f / rep_arrivals_f_total * 100) if rep_arrivals_f_total > 0 else 0.0
+        per_rep_block_rate_e.append(rep_block_rate_e)
+        per_rep_block_rate_f.append(rep_block_rate_f)
+        
+        # Empirical utilization within rep
+        rep_served_e = int(np.sum(rep_result['daily_served_e'][warmup:]))
+        rep_served_f = int(np.sum(rep_result['daily_served_f'][warmup:]))
+        rep_capacity_e = config.c_e * config.analysis_days if config.c_e > 0 else 0
+        rep_capacity_f = config.c_f * config.analysis_days if config.c_f > 0 else 0
+        rep_rho_e = rep_served_e / rep_capacity_e if rep_capacity_e > 0 else 0.0
+        rep_rho_f = rep_served_f / rep_capacity_f if rep_capacity_f > 0 else 0.0
+        per_rep_rho_e_emp.append(rep_rho_e)
+        per_rep_rho_f_emp.append(rep_rho_f)
+        
+        # Update global counters
+        total_blocked_e += rep_blocked_e
+        total_blocked_f += rep_blocked_f
+        total_served_e += rep_served_e
+        total_served_f += rep_served_f
+        total_arrivals_e_actual += rep_arrivals_e
+        total_arrivals_f_actual += rep_arrivals_f_total
     
     if progress_callback:
         progress_callback(config.num_replications, config.num_replications, "analysis")
 
+    # ===== Daily means and SDs across replications =====
     mean_daily_q_e = np.mean(all_daily_q_e, axis=0)
     mean_daily_q_f = np.mean(all_daily_q_f, axis=0)
     std_daily_q_e = np.std(all_daily_q_e, axis=0)
     std_daily_q_f = np.std(all_daily_q_f, axis=0)
+    
+    # Total queue across reps (mean and SD)
+    all_daily_total = [q_e + q_f for q_e, q_f in zip(all_daily_q_e, all_daily_q_f)]
+    mean_daily_total = np.mean(all_daily_total, axis=0)
+    std_daily_total = np.std(all_daily_total, axis=0)
     
     mean_daily_blocked_e = np.mean(all_daily_blocked_e, axis=0)
     mean_daily_blocked_f = np.mean(all_daily_blocked_f, axis=0)
     mean_daily_arrivals_e = np.mean(all_daily_arrivals_e, axis=0)
     mean_daily_arrivals_f = np.mean(all_daily_arrivals_f, axis=0)
     
-    warmup = config.warmup_days
-    avg_queue_e = np.mean([q[warmup:].mean() for q in all_daily_q_e])
-    avg_queue_f = np.mean([q[warmup:].mean() for q in all_daily_q_f])
+    # ===== Summary statistics: mean and SD across reps =====
+    def mean_sd(arr):
+        """Return (mean, sd) — sd undefined if fewer than 2 reps."""
+        if len(arr) == 0:
+            return 0.0, None
+        m = float(np.mean(arr))
+        s = float(np.std(arr, ddof=1)) if len(arr) > 1 else None
+        return m, s
     
-    avg_wait_e = np.mean(all_wait_resolved) if all_wait_resolved else 0
-    avg_wait_f = np.mean(all_ftf_wait_times) if all_ftf_wait_times else 0
-    avg_wait_converted = np.mean(all_wait_converted) if all_wait_converted else 0
-    avg_wait_direct = np.mean(all_wait_direct) if all_wait_direct else 0
+    avg_wait_e, sd_wait_e = mean_sd(per_rep_avg_wait_e)
+    avg_wait_f, sd_wait_f = mean_sd(per_rep_avg_wait_f)
+    avg_wait_direct, sd_wait_direct = mean_sd(per_rep_avg_wait_direct)
+    avg_wait_converted, sd_wait_converted = mean_sd(per_rep_avg_wait_converted)
+    weighted_avg_wait, sd_weighted_wait = mean_sd(per_rep_weighted_wait)
+    avg_queue_e, sd_queue_e = mean_sd(per_rep_avg_queue_e)
+    avg_queue_f, sd_queue_f = mean_sd(per_rep_avg_queue_f)
+    block_rate_e, sd_block_rate_e = mean_sd(per_rep_block_rate_e)
+    block_rate_f, sd_block_rate_f = mean_sd(per_rep_block_rate_f)
+    rho_e_empirical, sd_rho_e_emp = mean_sd(per_rep_rho_e_emp)
+    rho_f_empirical, sd_rho_f_emp = mean_sd(per_rep_rho_f_emp)
     
+    # Target day stats — mean and SD across reps that reached target
+    if all_target_days_e:
+        avg_target_day_e = float(np.mean(all_target_days_e))
+        sd_target_day_e = float(np.std(all_target_days_e, ddof=1)) if len(all_target_days_e) > 1 else None
+    else:
+        avg_target_day_e = None
+        sd_target_day_e = None
+    
+    if all_target_days_f:
+        avg_target_day_f = float(np.mean(all_target_days_f))
+        sd_target_day_f = float(np.std(all_target_days_f, ddof=1)) if len(all_target_days_f) > 1 else None
+    else:
+        avg_target_day_f = None
+        sd_target_day_f = None
+    
+    pct_reached_target_e = len(all_target_days_e) / config.num_replications * 100
+    pct_reached_target_f = len(all_target_days_f) / config.num_replications * 100
+    
+    # Patient counts
     n_resolved = len(all_wait_resolved)
     n_converted = len(all_wait_converted)
     n_direct = len(all_wait_direct)
-    n_total = n_resolved + n_converted + n_direct
     
-    if n_total > 0:
-        weighted_avg_wait = (
-            (n_resolved / n_total) * avg_wait_e +
-            (n_converted / n_total) * avg_wait_converted +
-            (n_direct / n_total) * avg_wait_direct
-        )
-    else:
-        weighted_avg_wait = 0
-    
-    block_rate_e = (total_blocked_e / total_arrivals_e_actual * 100) if total_arrivals_e_actual > 0 else 0
-    block_rate_f = (total_blocked_f / total_arrivals_f_actual * 100) if total_arrivals_f_actual > 0 else 0
-    
+    # Throughput
     analysis_days_total = config.analysis_days * config.num_replications
     throughput = (total_served_e + total_served_f) / analysis_days_total if analysis_days_total > 0 else 0
     
+    # Theoretical utilization
     rho_e_theoretical = config.rho_e
     rho_f_theoretical = config.rho_f
-    
-    total_capacity_e = config.c_e * config.analysis_days * config.num_replications
-    total_capacity_f = config.c_f * config.analysis_days * config.num_replications
-    rho_e_empirical = total_served_e / total_capacity_e if total_capacity_e > 0 else 0
-    rho_f_empirical = total_served_f / total_capacity_f if total_capacity_f > 0 else 0
-    
-    avg_target_day_e = np.mean(all_target_days_e) if all_target_days_e else None
-    avg_target_day_f = np.mean(all_target_days_f) if all_target_days_f else None
-    pct_reached_target_e = len(all_target_days_e) / config.num_replications * 100
-    pct_reached_target_f = len(all_target_days_f) / config.num_replications * 100
     
     results = {
         'daily_data': {
@@ -368,45 +465,187 @@ def run_simulation(params: Dict, progress_callback=None) -> Dict:
             'q_f': mean_daily_q_f,
             'q_e_std': std_daily_q_e,
             'q_f_std': std_daily_q_f,
-            'total_queue': mean_daily_q_e + mean_daily_q_f,
+            'total_queue': mean_daily_total,
+            'total_queue_std': std_daily_total,
             'blocked_e': mean_daily_blocked_e,
             'blocked_f': mean_daily_blocked_f,
             'arrivals_e': mean_daily_arrivals_e,
             'arrivals_f': mean_daily_arrivals_f,
         },
+        # Wait time means + SDs
         'avg_wait_e': avg_wait_e,
+        'sd_wait_e': sd_wait_e,
         'avg_wait_f': avg_wait_f,
+        'sd_wait_f': sd_wait_f,
         'avg_wait_converted': avg_wait_converted,
+        'sd_wait_converted': sd_wait_converted,
         'avg_wait_direct': avg_wait_direct,
+        'sd_wait_direct': sd_wait_direct,
         'weighted_avg_wait': weighted_avg_wait,
+        'sd_weighted_wait': sd_weighted_wait,
+        # Queue length means + SDs
         'avg_queue_e': avg_queue_e,
+        'sd_queue_e': sd_queue_e,
         'avg_queue_f': avg_queue_f,
+        'sd_queue_f': sd_queue_f,
+        # Blocking rates means + SDs
         'block_rate_e': block_rate_e,
+        'sd_block_rate_e': sd_block_rate_e,
         'block_rate_f': block_rate_f,
+        'sd_block_rate_f': sd_block_rate_f,
+        # Utilization
         'rho_e': rho_e_empirical,
         'rho_f': rho_f_empirical,
         'rho_e_theoretical': rho_e_theoretical,
         'rho_f_theoretical': rho_f_theoretical,
         'rho_e_empirical': rho_e_empirical,
+        'sd_rho_e_empirical': sd_rho_e_emp,
         'rho_f_empirical': rho_f_empirical,
+        'sd_rho_f_empirical': sd_rho_f_emp,
+        # Throughput / config
         'throughput': throughput,
         'warmup_day': config.warmup_days,
         'buffer_size_e': config.buffer_size_e,
         'buffer_size_f': config.buffer_size_f,
+        # Patient counts
         'n_resolved': n_resolved,
         'n_converted': n_converted,
         'n_direct': n_direct,
+        # Target days + SD
         'avg_target_day_e': avg_target_day_e,
+        'sd_target_day_e': sd_target_day_e,
         'avg_target_day_f': avg_target_day_f,
+        'sd_target_day_f': sd_target_day_f,
         'pct_reached_target_e': pct_reached_target_e,
         'pct_reached_target_f': pct_reached_target_f,
+        # Pass-through
         'target_q_e': config.target_q_e,
         'target_q_f': config.target_q_f,
         'initial_q_e': config.initial_q_e,
         'initial_q_f': config.initial_q_f,
+        'num_replications': config.num_replications,
     }
     
     return results
+
+
+def run_sensitivity(base_params: Dict,
+                    vary_param: str,
+                    values: List,
+                    progress_callback=None) -> Dict:
+    """
+    Run the simulation once for each value of `vary_param`, holding all other
+    parameters constant at the values in `base_params`.
+    
+    Parameters
+    ----------
+    base_params : dict
+        The full parameter dict for `run_simulation` (same shape as the main app uses).
+    vary_param : str
+        Key in base_params to vary (e.g., 'lambda_e', 'hrs_econsult').
+        Note: 'hrs_econsult', 'hrs_ftf', 'econsult_rate', 'ftf_rate' are NOT
+        direct simulation params — they are derived into 'c_e' and 'c_f'.
+        For those, we recompute c_e/c_f for each value.
+    values : list
+        List of values to try for vary_param.
+    progress_callback : callable, optional
+        Called with (current, total, phase) — phase = "sensitivity".
+    
+    Returns
+    -------
+    dict with:
+        - 'vary_param': name of varied parameter
+        - 'values': list of values tested
+        - 'rows': list of dicts (one per value), each with all key metrics
+        - 'base_params': copy of input base_params
+    """
+    rows = []
+    n_values = len(values)
+    
+    for i, val in enumerate(values):
+        if progress_callback:
+            progress_callback(i, n_values, "sensitivity")
+        
+        # Build a fresh params dict for this value
+        params = dict(base_params)
+        
+        # Handle derived parameters: capacity is computed from rate * hours
+        if vary_param == 'hrs_econsult':
+            params['hrs_econsult'] = val
+            rate = params.get('econsult_rate', 6.0)
+            params['c_e'] = int(val * rate)
+        elif vary_param == 'hrs_ftf':
+            params['hrs_ftf'] = val
+            rate = params.get('ftf_rate', 2.0)
+            params['c_f'] = int(val * rate)
+        elif vary_param == 'econsult_rate':
+            params['econsult_rate'] = val
+            hrs = params.get('hrs_econsult', 2.0)
+            params['c_e'] = int(hrs * val)
+        elif vary_param == 'ftf_rate':
+            params['ftf_rate'] = val
+            hrs = params.get('hrs_ftf', 6.0)
+            params['c_f'] = int(hrs * val)
+        else:
+            params[vary_param] = val
+        
+        # Run a single simulation (no inner progress callback)
+        sim_result = run_simulation(params)
+        
+        # Extract key metrics for the sensitivity row
+        row = {
+            'parameter_name': vary_param,
+            'parameter_value': val,
+            # Target days
+            'days_to_target_e': sim_result.get('avg_target_day_e'),
+            'sd_days_to_target_e': sim_result.get('sd_target_day_e'),
+            'pct_reached_target_e': sim_result.get('pct_reached_target_e'),
+            'days_to_target_f': sim_result.get('avg_target_day_f'),
+            'sd_days_to_target_f': sim_result.get('sd_target_day_f'),
+            'pct_reached_target_f': sim_result.get('pct_reached_target_f'),
+            # Wait times
+            'avg_wait_e': sim_result.get('avg_wait_e'),
+            'sd_wait_e': sim_result.get('sd_wait_e'),
+            'avg_wait_f': sim_result.get('avg_wait_f'),
+            'sd_wait_f': sim_result.get('sd_wait_f'),
+            'avg_wait_direct': sim_result.get('avg_wait_direct'),
+            'sd_wait_direct': sim_result.get('sd_wait_direct'),
+            'avg_wait_converted': sim_result.get('avg_wait_converted'),
+            'sd_wait_converted': sim_result.get('sd_wait_converted'),
+            'weighted_avg_wait': sim_result.get('weighted_avg_wait'),
+            'sd_weighted_wait': sim_result.get('sd_weighted_wait'),
+            # Queue lengths (steady-state)
+            'avg_queue_e': sim_result.get('avg_queue_e'),
+            'sd_queue_e': sim_result.get('sd_queue_e'),
+            'avg_queue_f': sim_result.get('avg_queue_f'),
+            'sd_queue_f': sim_result.get('sd_queue_f'),
+            # Blocking rates
+            'block_rate_e': sim_result.get('block_rate_e'),
+            'sd_block_rate_e': sim_result.get('sd_block_rate_e'),
+            'block_rate_f': sim_result.get('block_rate_f'),
+            'sd_block_rate_f': sim_result.get('sd_block_rate_f'),
+            # Utilization
+            'rho_e_theoretical': sim_result.get('rho_e_theoretical'),
+            'rho_f_theoretical': sim_result.get('rho_f_theoretical'),
+            'rho_e_empirical': sim_result.get('rho_e_empirical'),
+            'sd_rho_e_empirical': sim_result.get('sd_rho_e_empirical'),
+            'rho_f_empirical': sim_result.get('rho_f_empirical'),
+            'sd_rho_f_empirical': sim_result.get('sd_rho_f_empirical'),
+            # Capacity used (for diagnosis)
+            'c_e': params['c_e'],
+            'c_f': params['c_f'],
+        }
+        rows.append(row)
+    
+    if progress_callback:
+        progress_callback(n_values, n_values, "sensitivity_done")
+    
+    return {
+        'vary_param': vary_param,
+        'values': values,
+        'rows': rows,
+        'base_params': dict(base_params),
+    }
 
 
 def compute_theoretical_metrics(params: Dict) -> Dict:

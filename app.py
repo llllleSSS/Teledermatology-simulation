@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-from simulation import run_simulation, detect_steady_state
+from simulation import run_simulation, run_sensitivity, detect_steady_state
 
 # =============================================================================
 # PAGE CONFIG
@@ -178,6 +178,10 @@ if 'sim_results' not in st.session_state:
     st.session_state.sim_results = None
 if 'sim_params' not in st.session_state:
     st.session_state.sim_params = None
+if 'sens_results' not in st.session_state:
+    st.session_state.sens_results = None
+if 'sens_metric_choice' not in st.session_state:
+    st.session_state.sens_metric_choice = None
 
 # =============================================================================
 # ABOUT DIALOG
@@ -744,6 +748,131 @@ with summary_cols[2]:
     st.caption(f"FTF: **{max_q_f}** patients ({buffer_days_f} days × {c_f})")
 
 # =============================================================================
+# SENSITIVITY PANEL (in sidebar) — placed here so flow-chart inputs are defined
+# =============================================================================
+
+# Map of human-readable parameter labels -> (param_key, current_value, suggested_min, suggested_max, default_step, type)
+SENS_PARAM_OPTIONS = {
+    "Total hours/day for eConsult": ('hrs_econsult', hrs_econsult, max(0.5, hrs_econsult * 0.5), hrs_econsult * 2.0, 0.5, 'float'),
+    "Total hours/day for FTF":       ('hrs_ftf', hrs_ftf, max(0.5, hrs_ftf * 0.5), hrs_ftf * 2.0, 0.5, 'float'),
+    "eConsult cases per hour":       ('econsult_rate', econsult_rate, max(0.5, econsult_rate * 0.5), econsult_rate * 2.0, 0.5, 'float'),
+    "FTF cases per hour":            ('ftf_rate', ftf_rate, max(0.5, ftf_rate * 0.5), ftf_rate * 2.0, 0.5, 'float'),
+    "eConsult arrival rate":         ('lambda_e', lambda_e, max(1, lambda_e - 10), lambda_e + 10, 1, 'int'),
+    "Direct FTF arrival rate":       ('lambda_d', lambda_d, max(1, lambda_d - 10), lambda_d + 10, 1, 'int'),
+    "Conversion rate":               ('gamma', gamma, max(0.0, gamma - 0.2), min(1.0, gamma + 0.2), 0.05, 'float'),
+    "Buffer days (eConsult)":        ('buffer_days_e', buffer_days_e, 1, buffer_days_e * 2, 1, 'int'),
+    "Buffer days (FTF)":             ('buffer_days_f', buffer_days_f, 1, buffer_days_f * 2, 1, 'int'),
+}
+
+# Map of human-readable metric names -> (metric_key in row, sd_key in row, units, decimals)
+SENS_METRIC_OPTIONS = {
+    "Days to reach eConsult target": ('days_to_target_e', 'sd_days_to_target_e', 'days', 0),
+    "Days to reach FTF target":      ('days_to_target_f', 'sd_days_to_target_f', 'days', 0),
+    "% reps reached eConsult target": ('pct_reached_target_e', None, '%', 0),
+    "% reps reached FTF target":      ('pct_reached_target_f', None, '%', 0),
+    "Avg wait — eConsult resolved":  ('avg_wait_e', 'sd_wait_e', 'days', 1),
+    "Avg wait — FTF (all)":          ('avg_wait_f', 'sd_wait_f', 'days', 1),
+    "Avg wait — Direct FTF":         ('avg_wait_direct', 'sd_wait_direct', 'days', 1),
+    "Avg wait — Converted (total)":  ('avg_wait_converted', 'sd_wait_converted', 'days', 1),
+    "Weighted avg wait":             ('weighted_avg_wait', 'sd_weighted_wait', 'days', 1),
+    "Avg queue length (eConsult)":   ('avg_queue_e', 'sd_queue_e', 'patients', 1),
+    "Avg queue length (FTF)":        ('avg_queue_f', 'sd_queue_f', 'patients', 1),
+    "eConsult blocking rate":        ('block_rate_e', 'sd_block_rate_e', '%', 2),
+    "FTF blocking rate":             ('block_rate_f', 'sd_block_rate_f', '%', 2),
+    "eConsult utilization (empirical)": ('rho_e_empirical', 'sd_rho_e_empirical', '', 3),
+    "FTF utilization (empirical)":      ('rho_f_empirical', 'sd_rho_f_empirical', '', 3),
+}
+
+st.sidebar.markdown("---")
+
+with st.sidebar.expander("📈 Sensitivity Analysis", expanded=False):
+    st.caption("Vary one parameter and see how an output changes.")
+    
+    sens_param_label = st.selectbox(
+        "Vary this parameter",
+        list(SENS_PARAM_OPTIONS.keys()),
+        index=0,
+        key="sens_param_label",
+        help="Pick one parameter to vary while holding everything else at the values from the flow chart above."
+    )
+    
+    sens_param_key, sens_current_value, sugg_min, sugg_max, sugg_step, sens_type = SENS_PARAM_OPTIONS[sens_param_label]
+    
+    st.caption(f"Current value: **{sens_current_value}**")
+    
+    if sens_type == 'int':
+        col_a, col_b = st.columns(2)
+        with col_a:
+            sens_from = st.number_input("From", value=int(sugg_min), step=1, key="sens_from")
+        with col_b:
+            sens_to = st.number_input("To", value=int(sugg_max), step=1, key="sens_to")
+        sens_step = st.number_input("Step", value=int(sugg_step), step=1, min_value=1, key="sens_step")
+    else:  # float
+        col_a, col_b = st.columns(2)
+        with col_a:
+            sens_from = st.number_input("From", value=float(sugg_min), step=0.5, format="%.2f", key="sens_from")
+        with col_b:
+            sens_to = st.number_input("To", value=float(sugg_max), step=0.5, format="%.2f", key="sens_to")
+        sens_step = st.number_input("Step", value=float(sugg_step), step=0.1, min_value=0.01, format="%.2f", key="sens_step")
+    
+    # Build the list of values
+    sens_values = []
+    if sens_to >= sens_from and sens_step > 0:
+        n_vals_est = int(round((sens_to - sens_from) / sens_step)) + 1
+        for i in range(n_vals_est):
+            v = sens_from + i * sens_step
+            if sens_type == 'int':
+                v = int(round(v))
+            else:
+                v = round(v, 4)
+            if (sens_type == 'int' and v <= int(sens_to)) or (sens_type != 'int' and v <= sens_to + 1e-9):
+                sens_values.append(v)
+        # Deduplicate (in case rounding produces duplicates)
+        sens_values = sorted(set(sens_values))
+    
+    n_sens_values = len(sens_values)
+    if n_sens_values == 0:
+        st.warning("Range produces 0 values. Increase 'To' or decrease 'Step'.")
+    elif n_sens_values > 20:
+        st.warning(f"⚠ Range produces **{n_sens_values}** values — that's a lot. Consider increasing the step size.")
+    else:
+        st.caption(f"→ **{n_sens_values}** values to test: {sens_values[:5]}{'...' if n_sens_values > 5 else ''}")
+    
+    sens_metric_label = st.selectbox(
+        "Track this metric (for the plot)",
+        list(SENS_METRIC_OPTIONS.keys()),
+        index=1,  # default: "Days to reach FTF target"
+        key="sens_metric_label",
+        help="Pick the output metric to plot. The CSV download will include all metrics regardless."
+    )
+    
+    sens_replications = st.number_input(
+        "Replications per value",
+        min_value=5,
+        max_value=200,
+        value=20,
+        step=5,
+        key="sens_replications",
+        help="Number of simulation replications per parameter value. Lower = faster but noisier estimates. The main 'Number of replications' setting is not used for sensitivity."
+    )
+    
+    # Time estimate: rough heuristic
+    # Calibration: 1 rep × 1000 days ≈ 0.05 sec on typical hardware
+    est_seconds = max(1, int(n_sens_values * sens_replications * sim_horizon * 0.0001 * 1.5))
+    if est_seconds < 60:
+        est_str = f"~{est_seconds} sec"
+    else:
+        est_str = f"~{est_seconds // 60} min {est_seconds % 60} sec"
+    st.caption(f"⏱ Estimated time: **{est_str}**")
+    
+    run_sens_button = st.button(
+        "📊 Run Sensitivity Analysis",
+        type="secondary",
+        use_container_width=True,
+        disabled=(n_sens_values == 0)
+    )
+
+# =============================================================================
 # RUN SIMULATION
 # =============================================================================
 
@@ -793,6 +922,66 @@ if run_sim_button:
     st.success("Simulation complete!")
 
 # =============================================================================
+# RUN SENSITIVITY ANALYSIS
+# =============================================================================
+
+if run_sens_button and n_sens_values > 0:
+    if c_e == 0 and c_f == 0:
+        st.error("Please allocate some hours to at least one service type before running sensitivity.")
+        st.stop()
+    
+    sens_progress = st.progress(0, text="Initializing sensitivity analysis...")
+    
+    # Base params for the sensitivity sweep — same shape as a normal sim_params
+    # but with `num_replications` overridden to the sensitivity-specific value.
+    base_params = {
+        'buffer_days_e': buffer_days_e,
+        'buffer_days_f': buffer_days_f,
+        'lambda_e': lambda_e,
+        'lambda_d': lambda_d,
+        'c_e': c_e,
+        'c_f': c_f,
+        'gamma': gamma,
+        'sim_horizon': sim_horizon,           # inherited from main settings
+        'num_replications': sens_replications, # specific to sensitivity
+        'warmup_fraction': 0.5,
+        'initial_q_e': initial_q_e,
+        'initial_q_f': initial_q_f,
+        'target_q_e': target_q_e,
+        'target_q_f': target_q_f,
+        'econsult_rate': econsult_rate,
+        'ftf_rate': ftf_rate,
+        'hrs_econsult': hrs_econsult,
+        'hrs_ftf': hrs_ftf,
+    }
+    
+    def sens_progress_cb(current, total, phase):
+        if phase == "sensitivity":
+            frac = current / total if total > 0 else 0
+            sens_progress.progress(frac, text=f"Sensitivity: testing value {current + 1} of {total}...")
+        elif phase == "sensitivity_done":
+            sens_progress.progress(1.0, text="Sensitivity analysis complete.")
+    
+    sens_result = run_sensitivity(
+        base_params=base_params,
+        vary_param=sens_param_key,
+        values=sens_values,
+        progress_callback=sens_progress_cb
+    )
+    
+    # Add metadata for display
+    sens_result['param_label'] = sens_param_label
+    sens_result['metric_label'] = sens_metric_label
+    sens_result['current_value'] = sens_current_value
+    sens_result['replications'] = sens_replications
+    sens_result['horizon'] = sim_horizon
+    
+    st.session_state.sens_results = sens_result
+    
+    sens_progress.empty()
+    st.success(f"Sensitivity analysis complete: tested {len(sens_values)} values of {sens_param_label}.")
+
+# =============================================================================
 # DISPLAY RESULTS
 # =============================================================================
 
@@ -802,6 +991,13 @@ if st.session_state.sim_results is not None:
     
     warmup_day = results['warmup_day']
     sim_horizon_result = params['sim_horizon']
+    
+    def fmt_sd(mean, sd, decimals=1, suffix=''):
+        """Format a value with ± SD. SD shown only if defined and >= 2 reps."""
+        m_str = f"{mean:.{decimals}f}"
+        if sd is None:
+            return f"{m_str}{suffix}"
+        return f"{m_str} ± {sd:.{decimals}f}{suffix}"
     
     # -------------------------------------------------------------------------
     # BACKLOG REDUCTION ANALYSIS
@@ -815,7 +1011,7 @@ if st.session_state.sim_results is not None:
         if results['avg_target_day_e'] is not None:
             st.metric(
                 "Days to reach eConsult target",
-                f"{results['avg_target_day_e']:.0f} days",
+                fmt_sd(results['avg_target_day_e'], results['sd_target_day_e'], decimals=0, suffix=' days'),
                 delta=f"{results['pct_reached_target_e']:.0f}% of runs reached target",
                 delta_color="normal"
             )
@@ -831,7 +1027,7 @@ if st.session_state.sim_results is not None:
         if results['avg_target_day_f'] is not None:
             st.metric(
                 "Days to reach FTF target",
-                f"{results['avg_target_day_f']:.0f} days",
+                fmt_sd(results['avg_target_day_f'], results['sd_target_day_f'], decimals=0, suffix=' days'),
                 delta=f"{results['pct_reached_target_f']:.0f}% of runs reached target",
                 delta_color="normal"
             )
@@ -854,11 +1050,17 @@ if st.session_state.sim_results is not None:
     # Plot 1: Total Queue
     fig_total, ax_total = plt.subplots(figsize=(12, 3.5))
     
-    total_queue = results['daily_data']['q_e'] + results['daily_data']['q_f']
+    total_queue = results['daily_data']['total_queue']
+    total_queue_std = results['daily_data']['total_queue_std']
     initial_total = params['initial_q_e'] + params['initial_q_f']
     target_total = params['target_q_e'] + params['target_q_f']
     
-    ax_total.plot(days, total_queue, color=COLOR_TOTAL, linewidth=1.5, label='Total Queue')
+    # SD band (mean ± 1 SD across replications)
+    ax_total.fill_between(days,
+                          total_queue - total_queue_std,
+                          total_queue + total_queue_std,
+                          color=COLOR_TOTAL, alpha=0.15, label='± 1 SD')
+    ax_total.plot(days, total_queue, color=COLOR_TOTAL, linewidth=1.5, label='Total Queue (mean)')
     ax_total.axhline(y=initial_total, color='red', linestyle='--', alpha=0.5, label=f'Initial ({initial_total})')
     ax_total.axhline(y=target_total, color='green', linestyle='--', alpha=0.7, label=f'Target ({target_total})')
     ax_total.axvline(x=warmup_day, color='orange', linestyle=':', linewidth=2, alpha=0.8,
@@ -871,6 +1073,7 @@ if st.session_state.sim_results is not None:
     ax_total.set_title('Total Queue (eConsult + FTF) Over Time')
     ax_total.legend(loc='upper right', fontsize=8)
     ax_total.set_xlim(0, sim_horizon_result)
+    ax_total.set_ylim(bottom=0)
     ax_total.grid(True, alpha=0.3)
     
     st.pyplot(fig_total)
@@ -881,7 +1084,11 @@ if st.session_state.sim_results is not None:
     
     # eConsult queue (GREEN)
     ax1 = axes[0]
-    ax1.plot(days, results['daily_data']['q_e'], color=COLOR_ECONSULT, linewidth=1.5, label='eConsult Queue')
+    q_e_mean = results['daily_data']['q_e']
+    q_e_std = results['daily_data']['q_e_std']
+    ax1.fill_between(days, q_e_mean - q_e_std, q_e_mean + q_e_std,
+                     color=COLOR_ECONSULT, alpha=0.15, label='± 1 SD')
+    ax1.plot(days, q_e_mean, color=COLOR_ECONSULT, linewidth=1.5, label='eConsult Queue (mean)')
     ax1.axhline(y=params['initial_q_e'], color='red', linestyle='--', alpha=0.5, label=f'Initial ({params["initial_q_e"]})')
     ax1.axhline(y=params['target_q_e'], color='green', linestyle='--', alpha=0.7, label=f'Target ({params["target_q_e"]})')
     ax1.axvline(x=warmup_day, color='orange', linestyle=':', linewidth=2, alpha=0.8, label='Warmup ends')
@@ -900,11 +1107,16 @@ if st.session_state.sim_results is not None:
     ax1.set_title('eConsult Queue Over Time')
     ax1.legend(loc='upper right', fontsize=8)
     ax1.set_xlim(0, sim_horizon_result)
+    ax1.set_ylim(bottom=0)
     ax1.grid(True, alpha=0.3)
     
     # FTF queue (BLUE)
     ax2 = axes[1]
-    ax2.plot(days, results['daily_data']['q_f'], color=COLOR_FTF, linewidth=1.5, label='FTF Queue')
+    q_f_mean = results['daily_data']['q_f']
+    q_f_std = results['daily_data']['q_f_std']
+    ax2.fill_between(days, q_f_mean - q_f_std, q_f_mean + q_f_std,
+                     color=COLOR_FTF, alpha=0.15, label='± 1 SD')
+    ax2.plot(days, q_f_mean, color=COLOR_FTF, linewidth=1.5, label='FTF Queue (mean)')
     ax2.axhline(y=params['initial_q_f'], color='red', linestyle='--', alpha=0.5, label=f'Initial ({params["initial_q_f"]})')
     ax2.axhline(y=params['target_q_f'], color='green', linestyle='--', alpha=0.7, label=f'Target ({params["target_q_f"]})')
     ax2.axvline(x=warmup_day, color='orange', linestyle=':', linewidth=2, alpha=0.8, label='Warmup ends')
@@ -923,6 +1135,7 @@ if st.session_state.sim_results is not None:
     ax2.set_title('FTF Queue Over Time')
     ax2.legend(loc='upper right', fontsize=8)
     ax2.set_xlim(0, sim_horizon_result)
+    ax2.set_ylim(bottom=0)
     ax2.grid(True, alpha=0.3)
     
     plt.tight_layout()
@@ -942,15 +1155,15 @@ if st.session_state.sim_results is not None:
     col1, col2, col3, col4, col5 = st.columns(5)
     
     with col1:
-        st.metric("eConsult (resolved)", f"{results['avg_wait_e']:.1f} days")
+        st.metric("eConsult (resolved)", fmt_sd(results['avg_wait_e'], results['sd_wait_e'], 1, ' days'))
     with col2:
-        st.metric("FTF (all patients)", f"{results['avg_wait_f']:.1f} days")
+        st.metric("FTF (all patients)", fmt_sd(results['avg_wait_f'], results['sd_wait_f'], 1, ' days'))
     with col3:
-        st.metric("Direct FTF", f"{results['avg_wait_direct']:.1f} days")
+        st.metric("Direct FTF", fmt_sd(results['avg_wait_direct'], results['sd_wait_direct'], 1, ' days'))
     with col4:
-        st.metric("Converted (total)", f"{results['avg_wait_converted']:.1f} days")
+        st.metric("Converted (total)", fmt_sd(results['avg_wait_converted'], results['sd_wait_converted'], 1, ' days'))
     with col5:
-        st.metric("Weighted Average", f"{results['weighted_avg_wait']:.1f} days")
+        st.metric("Weighted Average", fmt_sd(results['weighted_avg_wait'], results['sd_weighted_wait'], 1, ' days'))
     
     # Patient Flow
     st.subheader("👥 Patient Flow")
@@ -1056,10 +1269,10 @@ if st.session_state.sim_results is not None:
                 f"{results['rho_f_theoretical']:.3f}",
                 f"{total_theoretical:.3f}"
             ],
-            'Empirical': [
-                f"{results['rho_e_empirical']:.3f}",
-                f"{results['rho_f_empirical']:.3f}",
-                f"{total_empirical:.3f}"
+            'Empirical (mean ± SD)': [
+                fmt_sd(results['rho_e_empirical'], results['sd_rho_e_empirical'], 3),
+                fmt_sd(results['rho_f_empirical'], results['sd_rho_f_empirical'], 3),
+                f"{total_empirical:.3f}"  # weighted blend; no per-rep value tracked
             ],
             'Status': [
                 "✅ OK" if results['rho_e_theoretical'] < 1 else "⚠️ Overloaded",
@@ -1071,7 +1284,7 @@ if st.session_state.sim_results is not None:
         
         st.caption("""
         **Theoretical utilization** = arrival rate / capacity  
-        **Empirical utilization** = actual served / available capacity
+        **Empirical utilization** = actual served / available capacity (± SD across replications)
         """)
     
     # Blocking Rates
@@ -1079,9 +1292,9 @@ if st.session_state.sim_results is not None:
     
     col1, col2 = st.columns(2)
     with col1:
-        st.metric("eConsult Blocking Rate", f"{results['block_rate_e']:.2f}%")
+        st.metric("eConsult Blocking Rate", fmt_sd(results['block_rate_e'], results['sd_block_rate_e'], 2, '%'))
     with col2:
-        st.metric("FTF Blocking Rate", f"{results['block_rate_f']:.2f}%")
+        st.metric("FTF Blocking Rate", fmt_sd(results['block_rate_f'], results['sd_block_rate_f'], 2, '%'))
     
     fig_block, ax_block = plt.subplots(figsize=(12, 3))
     
@@ -1109,6 +1322,85 @@ if st.session_state.sim_results is not None:
 
 else:
     st.info("👆 Configure your parameters in the flow chart above and click **Run Simulation** in the sidebar.")
+
+# =============================================================================
+# DISPLAY SENSITIVITY RESULTS
+# =============================================================================
+
+if st.session_state.sens_results is not None:
+    sens = st.session_state.sens_results
+    
+    st.markdown("---")
+    st.header("📈 Sensitivity Analysis Results")
+    
+    # Top metadata
+    col_meta1, col_meta2, col_meta3, col_meta4 = st.columns(4)
+    with col_meta1:
+        st.markdown(f"**Parameter varied**\n\n{sens['param_label']}")
+    with col_meta2:
+        n_v = len(sens['values'])
+        if n_v > 0:
+            st.markdown(f"**Range**\n\n{sens['values'][0]} to {sens['values'][-1]} ({n_v} values)")
+    with col_meta3:
+        st.markdown(f"**Tracked metric**\n\n{sens['metric_label']}")
+    with col_meta4:
+        st.markdown(f"**Settings**\n\n{sens['replications']} reps × {sens['horizon']} days")
+    
+    # Get metric metadata
+    metric_key, sd_key, units, decimals = SENS_METRIC_OPTIONS[sens['metric_label']]
+    
+    # Build x and y arrays
+    x_vals = [r['parameter_value'] for r in sens['rows']]
+    y_vals_raw = [r.get(metric_key) for r in sens['rows']]
+    
+    # Some metrics (like days_to_target) can be None for individual values
+    # Replace None with NaN for plotting
+    y_vals = [float(v) if v is not None else float('nan') for v in y_vals_raw]
+    
+    # Plot
+    fig_sens, ax_sens = plt.subplots(figsize=(11, 4.5))
+    
+    ax_sens.plot(x_vals, y_vals, marker='o', linewidth=2, markersize=7,
+                 color='#4F46E5', label=sens['metric_label'])
+    
+    # Vertical line at current value
+    if sens['current_value'] is not None:
+        ax_sens.axvline(x=sens['current_value'], color='red', linestyle='--', alpha=0.6,
+                        linewidth=1.5, label=f'Current value ({sens["current_value"]})')
+    
+    # Annotate any None values
+    for x, y_raw, y in zip(x_vals, y_vals_raw, y_vals):
+        if y_raw is None:
+            ax_sens.annotate('Not reached', xy=(x, 0), xytext=(0, 5),
+                             textcoords='offset points', ha='center',
+                             fontsize=8, color='gray', style='italic')
+    
+    units_str = f" ({units})" if units else ""
+    ax_sens.set_xlabel(sens['param_label'], fontsize=11)
+    ax_sens.set_ylabel(f"{sens['metric_label']}{units_str}", fontsize=11)
+    ax_sens.set_title(f"Sensitivity: {sens['metric_label']} vs {sens['param_label']}", fontsize=12)
+    ax_sens.grid(True, alpha=0.3)
+    ax_sens.legend(loc='best', fontsize=9)
+    
+    st.pyplot(fig_sens)
+    plt.close()
+    
+    # Show data table
+    with st.expander("📋 View data table", expanded=False):
+        # Build a tidy DataFrame from rows
+        df_sens = pd.DataFrame(sens['rows'])
+        st.dataframe(df_sens, hide_index=True, use_container_width=True)
+    
+    # CSV download
+    df_sens = pd.DataFrame(sens['rows'])
+    csv_bytes = df_sens.to_csv(index=False).encode('utf-8')
+    st.download_button(
+        label="📥 Download all metrics as CSV",
+        data=csv_bytes,
+        file_name=f"sensitivity_{sens['vary_param']}.csv",
+        mime="text/csv",
+        help="Download the full table of all output metrics across all parameter values."
+    )
 
 # =============================================================================
 # FOOTER
